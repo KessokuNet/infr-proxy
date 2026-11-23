@@ -192,3 +192,7 @@ wait and the upstream call are separate children named `model.queue` and
 
 Neither endpoint identifies the caller: requests arrive from localhost. The
 metrics port has no authentication either, so keep it on a trusted network.
+
+## License
+
+AGPL-3.0-only. See [LICENSE](LICENSE).
