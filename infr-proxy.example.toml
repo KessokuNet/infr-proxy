@@ -1,0 +1,31 @@
+listen = "127.0.0.1:11435"
+queue_timeout_secs = 240
+load_timeout_secs = 120
+poll_interval_ms = 250
+max_model_size = "8GiB"
+# cache_dir = "/var/lib/infr-proxy/models"
+# Read-only stores scanned like the cache, e.g. an Ollama install.
+# extra_model_dirs = ["/var/lib/ollama/.ollama/models"]
+# Ids never served, even when a store has them.
+# exclude = ["embeddinggemma-2:latest"]
+
+# Registry overrides. Hugging Face speaks the same v2 API, so hf.co needs no
+# entry; add one for a scheme, a token env, or a mirror.
+# [[registry]]
+# host = "hf.co"
+# scheme = "https"
+# token_env = "HF_TOKEN"
+# mirrors = ["https://mirror.example"]
+
+# Models come from the cache: `ollama pull` through this proxy or
+# `infr-proxy pull <reference>` is enough, no entry needed. Each model gets
+# $XDG_RUNTIME_DIR/infr/<instance>.sock through its infr@.socket unit.
+# A [[model]] entry only overrides a cached id or adds a GGUF outside the cache.
+#
+# [[model]]
+# id = "qwen2.5:1.5b"
+# instance = "qwen2.5-1.5b" # derived from the id when absent
+#
+# [[model]]
+# id = "local-model"
+# source = "/var/lib/infr/models/model.gguf"

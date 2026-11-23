@@ -1,0 +1,15 @@
+[Unit]
+Description=infr-proxy, the OpenAI-compatible router for infr model units
+After=network.target
+
+[Service]
+Type=exec
+RuntimeDirectory=infr
+RuntimeDirectoryPreserve=yes
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart=%h/.local/bin/infr-proxy
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

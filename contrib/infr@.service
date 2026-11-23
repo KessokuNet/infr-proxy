@@ -1,0 +1,16 @@
+[Unit]
+Description=infr serve for %i
+After=network-online.target
+Requires=infr@%i.socket
+After=infr@%i.socket
+
+[Service]
+Type=exec
+EnvironmentFile=-%t/infr/%i.env
+ExecStart=%h/.local/bin/infr serve ${INFR_MODEL}
+Environment=INFR_SERVE_IDLE_SECS=300
+Restart=no
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target
