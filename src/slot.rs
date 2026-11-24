@@ -351,6 +351,32 @@ impl Slot {
         }
     }
 
+    /// Stop the unit of a model that is going away, without waiting for its
+    /// in-flight requests: the file they read is about to disappear.
+    pub async fn evict(&self, id: &str) -> Result<(), SlotError> {
+        let _switch = self.switch.lock().await;
+        let model = {
+            let mut phase = self.phase.lock().await;
+            match &*phase {
+                Phase::Running(model) | Phase::Draining(model) if model.id == id => {
+                    let model = model.clone();
+                    *phase = Phase::Idle;
+                    Some(model)
+                }
+                _ => None,
+            }
+        };
+        let Some(model) = model else {
+            return Ok(());
+        };
+        self.notify.notify_waiters();
+        tracing::info!(model = %model.id, instance = %model.instance, "evicting the resident model");
+        self.host
+            .stop(&model)
+            .await
+            .map_err(|err| SlotError::Backend(format!("stop {}: {err}", model.instance)))
+    }
+
     #[cfg(test)]
     pub async fn acquire(self: &Arc<Self>, id: &str) -> Result<Lease, SlotError> {
         self.acquire_model(id).await.map(|(_, lease)| lease)
@@ -581,6 +607,7 @@ mod tests {
     use super::*;
     use crate::config::ModelEntry;
     use crate::host::RunningModel;
+    use crate::registry::write_test_model;
 
     #[derive(Default)]
     struct FakeHost {
@@ -680,31 +707,6 @@ mod tests {
         }
     }
 
-    /// Write a manifest and blob the way a pull does, without a registry.
-    async fn cache_model(dir: &Path, id: &str, bytes: &[u8]) {
-        let reference = Reference::parse(id).unwrap();
-        let digest = crate::registry::sha256_hex(bytes);
-        let blob = dir.join("blobs").join(format!("sha256-{digest}"));
-        tokio::fs::create_dir_all(blob.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&blob, bytes).await.unwrap();
-        let raw = format!(
-            "{{\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"layers\":[{{\"mediaType\":\"application/vnd.ollama.image.model\",\"digest\":\"sha256:{digest}\",\"size\":{}}}]}}",
-            bytes.len()
-        );
-        let path = dir
-            .join("manifests")
-            .join(&reference.host)
-            .join(&reference.namespace)
-            .join(&reference.name)
-            .join(&reference.tag);
-        tokio::fs::create_dir_all(path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(path, raw).await.unwrap();
-    }
-
     #[tokio::test]
     async fn adopts_a_running_config_model() {
         let dir = tempfile::tempdir().unwrap();
@@ -733,7 +735,7 @@ mod tests {
     async fn adopts_a_running_cached_model() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
-        cache_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
+        write_test_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
         let blob = format!("sha256-{}", crate::registry::sha256_hex(b"cached model"));
         let source = dir
             .path()
@@ -814,6 +816,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evicting_stops_the_resident_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(FakeHost::default());
+        write_test_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
+        let slot = Arc::new(
+            Slot::with_host(
+                empty_config(dir.path()),
+                host.clone(),
+                dir.path().to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let lease = slot.acquire("qwen2.5:1.5b").await.unwrap();
+        drop(lease);
+        assert_eq!(slot.resident().await.as_deref(), Some("qwen2.5:1.5b"));
+
+        slot.evict("qwen2.5:1.5b").await.unwrap();
+        assert_eq!(
+            host.calls(),
+            vec!["start qwen2.5:1.5b", "stop qwen2.5:1.5b"]
+        );
+        assert_eq!(slot.resident().await, None);
+
+        // A second delete of the same id has nothing left to stop.
+        slot.evict("qwen2.5:1.5b").await.unwrap();
+        assert_eq!(
+            host.calls(),
+            vec!["start qwen2.5:1.5b", "stop qwen2.5:1.5b"]
+        );
+    }
+
+    #[tokio::test]
     async fn switch_waits_for_the_lease_then_stops_before_starting() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
@@ -883,7 +919,7 @@ mod tests {
     async fn serves_a_cached_model_without_a_config_entry() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
-        cache_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
+        write_test_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
         let slot = Arc::new(
             Slot::with_host(
                 empty_config(dir.path()),
@@ -920,7 +956,7 @@ mod tests {
     async fn a_config_entry_overrides_a_cached_model() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
-        cache_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
+        write_test_model(dir.path(), "qwen2.5:1.5b", b"cached model").await;
         let mut config = empty_config(dir.path());
         config.models.push(ModelEntry {
             id: "qwen2.5:1.5b".into(),
@@ -948,7 +984,7 @@ mod tests {
     async fn excluded_models_are_not_served_or_listed() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
-        cache_model(dir.path(), "big:1", b"model").await;
+        write_test_model(dir.path(), "big:1", b"model").await;
         let mut config = empty_config(dir.path());
         config.exclude = vec!["big:1".into()];
         let slot = Arc::new(
@@ -965,7 +1001,7 @@ mod tests {
     async fn oversized_cached_models_are_not_offered() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
-        cache_model(dir.path(), "big:1", b"0123456789").await;
+        write_test_model(dir.path(), "big:1", b"0123456789").await;
         let mut config = empty_config(dir.path());
         config.max_model_size = Some(ByteSize::b(4));
         let slot = Arc::new(

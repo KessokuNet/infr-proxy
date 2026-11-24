@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 use crate::config::RegistryEntry;
 
@@ -164,6 +166,14 @@ pub struct ManifestRef {
 }
 
 impl Manifest {
+    /// Every blob this manifest points at, model layers and child manifests alike.
+    fn blob_digests(&self) -> impl Iterator<Item = &str> {
+        self.layers
+            .iter()
+            .map(|layer| layer.digest.as_str())
+            .chain(self.manifests.iter().map(|child| child.digest.as_str()))
+    }
+
     fn model_layer(&self) -> Result<&Layer> {
         ensure!(
             self.media_type == MANIFEST_ACCEPT,
@@ -271,6 +281,55 @@ impl Cache {
         Ok(references)
     }
 
+    /// Remove one manifest and the directories it leaves empty.
+    pub async fn remove_manifest(&self, reference: &Reference) -> Result<Option<Manifest>> {
+        let Some((manifest, _)) = self.read_manifest(reference).await? else {
+            return Ok(None);
+        };
+        let path = self.manifest_path(reference);
+        tokio::fs::remove_file(&path)
+            .await
+            .wrap_err_with(|| format!("remove {}", path.display()))?;
+
+        let root = self.root.join("manifests");
+        let mut dir = path.parent().map(Path::to_path_buf);
+        while let Some(current) = dir {
+            if current == root || tokio::fs::remove_dir(&current).await.is_err() {
+                break;
+            }
+            dir = current.parent().map(Path::to_path_buf);
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Blob digests every manifest in this cache still references.
+    pub async fn retained_digests(&self) -> Result<HashSet<String>> {
+        let mut retained = HashSet::new();
+        for reference in self.manifests().await? {
+            let Some((manifest, _)) = self.read_manifest(&reference).await? else {
+                continue;
+            };
+            retained.extend(manifest.blob_digests().map(str::to_owned));
+        }
+        Ok(retained)
+    }
+
+    /// Remove a blob, returning the bytes it occupied.
+    async fn remove_blob(&self, digest: &str) -> Result<u64> {
+        let Ok(path) = self.blob_path(digest) else {
+            return Ok(0);
+        };
+        let size = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err).wrap_err_with(|| format!("stat {}", path.display())),
+        };
+        tokio::fs::remove_file(&path)
+            .await
+            .wrap_err_with(|| format!("remove {}", path.display()))?;
+        Ok(size)
+    }
+
     pub async fn write_manifest(&self, reference: &Reference, raw: &[u8]) -> Result<()> {
         let path = self.manifest_path(reference);
         let dir = path
@@ -317,6 +376,26 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     digest_hex(hasher)
+}
+
+/// A manifest and its blob where a pull leaves them, for tests across modules.
+#[cfg(test)]
+pub(crate) async fn write_test_model(root: &Path, id: &str, bytes: &[u8]) {
+    let reference = Reference::parse(id).unwrap();
+    let digest = sha256_hex(bytes);
+    let blob = root.join("blobs").join(format!("sha256-{digest}"));
+    tokio::fs::create_dir_all(blob.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&blob, bytes).await.unwrap();
+    let raw = format!(
+        "{{\"mediaType\":\"{MANIFEST_ACCEPT}\",\"layers\":[{{\"mediaType\":\"{MODEL_LAYER}\",\"digest\":\"sha256:{digest}\",\"size\":{}}}]}}",
+        bytes.len()
+    );
+    Cache::new(root.to_path_buf())
+        .write_manifest(&reference, raw.as_bytes())
+        .await
+        .unwrap();
 }
 
 fn digest_hex(hasher: Sha256) -> String {
@@ -443,6 +522,18 @@ pub struct Registry {
     cache: Cache,
     stores: Vec<Cache>,
     entries: Vec<RegistryEntry>,
+    /// Serialises manifest writes against the delete path's blob sweep.
+    mutations: Mutex<()>,
+}
+
+/// What a delete request found in the writable cache.
+pub enum Removal {
+    /// The manifest and every blob only it referenced are gone.
+    Removed,
+    /// The reference exists, but only in a read-only store.
+    ReadOnly,
+    /// No manifest anywhere.
+    Missing,
 }
 
 impl Registry {
@@ -459,6 +550,7 @@ impl Registry {
             cache: Cache::new(cache_root),
             stores: store_roots.into_iter().map(Cache::new).collect(),
             entries,
+            mutations: Mutex::new(()),
         })
     }
 
@@ -523,6 +615,50 @@ impl Registry {
         Ok(references)
     }
 
+    /// Delete a tag: its manifest first, then every blob no other manifest uses.
+    pub async fn remove(&self, reference: &Reference) -> Result<Removal> {
+        let _guard = self.mutations.lock().await;
+        let Some(manifest) = self.cache.remove_manifest(reference).await? else {
+            let mut in_store = false;
+            for store in &self.stores {
+                if tokio::fs::metadata(store.manifest_path(reference))
+                    .await
+                    .is_ok()
+                {
+                    in_store = true;
+                    break;
+                }
+            }
+            return Ok(if in_store {
+                Removal::ReadOnly
+            } else {
+                Removal::Missing
+            });
+        };
+
+        let retained = match self.cache.retained_digests().await {
+            Ok(retained) => retained,
+            Err(err) => {
+                tracing::warn!(reference = %reference, error = %err, "kept the blobs: could not scan the cache");
+                return Ok(Removal::Removed);
+            }
+        };
+        let mut freed = 0;
+        let mut blobs = 0;
+        for digest in manifest.blob_digests() {
+            if retained.contains(digest) {
+                continue;
+            }
+            let size = self.cache.remove_blob(digest).await?;
+            if size > 0 {
+                freed += size;
+                blobs += 1;
+            }
+        }
+        tracing::info!(reference = %reference, freed, blobs, "removed the model");
+        Ok(Removal::Removed)
+    }
+
     /// Resolve a config source and its Ollama-compatible model digest.
     pub async fn resolve_source(&self, model_id: &str, source: &str) -> Result<Resolved> {
         if is_path(source) {
@@ -577,6 +713,7 @@ impl Registry {
             && meta.len() == layer.size
         {
             tracing::info!(reference = %reference, path = %blob.display(), "already cached");
+            let _guard = self.mutations.lock().await;
             self.cache.write_manifest(reference, &raw).await?;
             return Ok(blob);
         }
@@ -598,6 +735,7 @@ impl Registry {
 
         self.download(reference, &layer, &blob, &endpoint, &mut progress)
             .await?;
+        let _guard = self.mutations.lock().await;
         self.cache.write_manifest(reference, &raw).await?;
         tracing::info!(reference = %reference, path = %blob.display(), "cached");
         Ok(blob)
@@ -733,24 +871,6 @@ impl Registry {
 mod tests {
     use super::*;
 
-    async fn write_model(cache: &Cache, id: &str, bytes: &[u8]) {
-        let reference = Reference::parse(id).unwrap();
-        let digest = sha256_hex(bytes);
-        let blob = cache.blob_path(&format!("sha256:{digest}")).unwrap();
-        tokio::fs::create_dir_all(blob.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&blob, bytes).await.unwrap();
-        let raw = format!(
-            "{{\"mediaType\":\"{MANIFEST_ACCEPT}\",\"layers\":[{{\"mediaType\":\"{MODEL_LAYER}\",\"digest\":\"sha256:{digest}\",\"size\":{}}}]}}",
-            bytes.len()
-        );
-        cache
-            .write_manifest(&reference, raw.as_bytes())
-            .await
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn local_ollama_blob_uses_the_sha256_of_its_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -807,6 +927,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn removing_a_tag_keeps_blobs_another_tag_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        write_test_model(cache.root(), "shared:1", b"shared model").await;
+        write_test_model(cache.root(), "shared:2", b"shared model").await;
+        write_test_model(cache.root(), "unique:1", b"unique model").await;
+        let registry = Registry::new(cache.root().to_path_buf(), Vec::new(), Vec::new()).unwrap();
+
+        let removal = registry
+            .remove(&Reference::parse("shared:1").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(removal, Removal::Removed));
+        assert!(
+            cache
+                .blob_path(&format!("sha256:{}", sha256_hex(b"shared model")))
+                .unwrap()
+                .exists()
+        );
+
+        let removal = registry
+            .remove(&Reference::parse("unique:1").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(removal, Removal::Removed));
+        assert!(
+            !cache
+                .blob_path(&format!("sha256:{}", sha256_hex(b"unique model")))
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(
+            registry.manifests().await.unwrap(),
+            vec![Reference::parse("shared:2").unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_only_model_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Cache::new(dir.path().join("store"));
+        write_test_model(store.root(), "qwen2.5:0.5b", b"store model").await;
+        let registry = Registry::new(
+            dir.path().join("cache"),
+            vec![store.root().to_path_buf()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let removal = registry
+            .remove(&Reference::parse("qwen2.5:0.5b").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(removal, Removal::ReadOnly));
+        assert!(
+            store
+                .blob_path(&format!("sha256:{}", sha256_hex(b"store model")))
+                .unwrap()
+                .exists()
+        );
+
+        let removal = registry
+            .remove(&Reference::parse("nobody:home").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(removal, Removal::Missing));
+    }
+
     #[test]
     fn parses_ollama_references_with_defaults() {
         let short = Reference::parse("qwen2.5:1.5b").unwrap();
@@ -841,8 +1030,8 @@ mod tests {
     async fn scans_the_manifest_tree_into_display_ids() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
-        write_model(&cache, "qwen2.5:1.5b", b"model").await;
-        write_model(&cache, "hf.co/ns/model:Q4_K_M", b"model").await;
+        write_test_model(cache.root(), "qwen2.5:1.5b", b"model").await;
+        write_test_model(cache.root(), "hf.co/ns/model:Q4_K_M", b"model").await;
 
         let ids: Vec<String> = cache
             .manifests()
@@ -859,7 +1048,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writable = Cache::new(dir.path().join("cache"));
         let store = Cache::new(dir.path().join("store"));
-        write_model(&store, "qwen2.5:1.5b", b"from the store").await;
+        write_test_model(store.root(), "qwen2.5:1.5b", b"from the store").await;
 
         let registry = Registry::new(
             dir.path().join("cache"),
@@ -872,7 +1061,7 @@ mod tests {
         assert_eq!(resolved.size, b"from the store".len() as u64);
         assert_eq!(registry.manifests().await.unwrap().len(), 1);
 
-        write_model(&writable, "qwen2.5:1.5b", b"from the cache").await;
+        write_test_model(writable.root(), "qwen2.5:1.5b", b"from the cache").await;
         let resolved = registry.cached(&reference).await.unwrap();
         assert_eq!(resolved.size, b"from the cache".len() as u64);
         assert_eq!(registry.manifests().await.unwrap().len(), 1);

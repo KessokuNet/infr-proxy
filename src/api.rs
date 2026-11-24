@@ -11,7 +11,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,7 +23,7 @@ use tracing::Instrument;
 
 use crate::config::Model;
 use crate::gguf;
-use crate::registry::Reference;
+use crate::registry::{Reference, Removal};
 use crate::slot::{Lease, Slot, SlotError};
 use crate::telemetry::{HttpMeter, MeteredBody, MeteredStream, RequestMeter, Usage};
 
@@ -137,6 +137,7 @@ pub fn router(slot: Arc<Slot>) -> Router {
         .route("/api/ps", get(ps))
         .route("/api/show", post(show))
         .route("/api/pull", post(pull))
+        .route("/api/delete", delete(delete_model))
         .route("/api/chat", post(ollama_chat))
         .route("/api/generate", post(ollama_generate))
         .with_state(state)
@@ -168,6 +169,7 @@ fn method_label(method: &str) -> &'static str {
         "GET" => "GET",
         "HEAD" => "HEAD",
         "POST" => "POST",
+        "DELETE" => "DELETE",
         _ => "other",
     }
 }
@@ -186,6 +188,7 @@ fn route_label(path: &str) -> &'static str {
         "/api/ps" => "/api/ps",
         "/api/show" => "/api/show",
         "/api/pull" => "/api/pull",
+        "/api/delete" => "/api/delete",
         "/api/chat" => "/api/chat",
         "/api/generate" => "/api/generate",
         _ => "unmatched",
@@ -504,6 +507,57 @@ async fn pull(
         HeaderValue::from_static("application/x-ndjson"),
     );
     Ok(response)
+}
+
+#[derive(Deserialize)]
+struct DeleteRequest {
+    model: Option<String>,
+    name: Option<String>,
+}
+
+/// `ollama rm`. The CLI stops the model itself over `/api/generate` first, but
+/// other clients do not, so the unit is evicted here as well.
+async fn delete_model(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<StatusCode, OllamaError> {
+    if body.is_empty() {
+        return Err(OllamaError::bad_request("missing request body"));
+    }
+    let request: DeleteRequest = serde_json::from_slice(&body)
+        .map_err(|err| OllamaError::bad_request(format!("invalid JSON body: {err}")))?;
+    let id = request
+        .model
+        .filter(|model| !model.is_empty())
+        .or(request.name)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| OllamaError::bad_request("model is required"))?;
+    let reference =
+        Reference::parse(&id).map_err(|err| OllamaError::bad_request(err.to_string()))?;
+
+    match state.slot.registry().remove(&reference).await {
+        Ok(Removal::Removed) => {
+            state
+                .slot
+                .evict(&reference.display_id())
+                .await
+                .map_err(|err| OllamaError::from_slot(err, &id))?;
+            Ok(StatusCode::OK)
+        }
+        Ok(Removal::ReadOnly) => Err(OllamaError::bad_request(format!(
+            "model {id} lives in a read-only model store; delete it there"
+        ))),
+        Ok(Removal::Missing) => {
+            // A `[[model]]` entry is served from a configured file, not a manifest.
+            if state.slot.model(&id).await.is_ok() {
+                return Err(OllamaError::bad_request(format!(
+                    "model {id} is a config entry; remove it from the config"
+                )));
+            }
+            Err(OllamaError::not_cached(&id))
+        }
+        Err(err) => Err(OllamaError::backend(err.to_string())),
+    }
 }
 
 async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
@@ -1296,6 +1350,14 @@ impl OllamaError {
         }
     }
 
+    /// Ollama's wording, which a delete prints back to the user.
+    fn not_cached(id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: format!("model '{id}' not found"),
+        }
+    }
+
     fn backend(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -1438,7 +1500,7 @@ mod tests {
     }
 
     struct Proxy {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         addr: std::net::SocketAddr,
     }
 
@@ -1492,7 +1554,12 @@ mod tests {
                 axum::serve(listener, router(slot)).await.unwrap();
             });
 
-            Self { _dir: dir, addr }
+            Self { dir, addr }
+        }
+
+        /// A cached model the way a pull leaves it.
+        async fn cache_model(&self, id: &str, bytes: &[u8]) {
+            crate::registry::write_test_model(&self.dir.path().join("cache"), id, bytes).await;
         }
 
         async fn complete(&self) {
@@ -1503,6 +1570,59 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_model_removes_its_manifest_and_blob() {
+        let proxy = Proxy::start(Router::new()).await;
+        proxy.cache_model("qwen2.5:1.5b", b"cached model").await;
+        let client = reqwest::Client::new();
+        let delete = || {
+            client
+                .delete(format!("http://{}/api/delete", proxy.addr))
+                .json(&json!({ "model": "qwen2.5:1.5b" }))
+                .send()
+        };
+
+        let tags: serde_json::Value = client
+            .get(format!("http://{}/api/tags", proxy.addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(tags["models"].as_array().unwrap().len(), 2);
+
+        assert_eq!(delete().await.unwrap().status(), 200);
+        let blob = proxy.dir.path().join("cache/blobs").join(format!(
+            "sha256-{}",
+            crate::registry::sha256_hex(b"cached model")
+        ));
+        assert!(!blob.exists());
+
+        let response = delete().await.unwrap();
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "model 'qwen2.5:1.5b' not found");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_config_entry_points_at_the_config() {
+        let proxy = Proxy::start(Router::new()).await;
+
+        let response = reqwest::Client::new()
+            .delete(format!("http://{}/api/delete", proxy.addr))
+            .json(&json!({ "model": "test:model" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"],
+            "model test:model is a config entry; remove it from the config"
+        );
     }
 
     #[tokio::test]

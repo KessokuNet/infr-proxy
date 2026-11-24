@@ -117,7 +117,8 @@ cap can still fail to load once the KV cache is added.
 
 Implemented: `HEAD /` (the CLI's connectivity probe), `GET /api/version`,
 `GET /api/tags`, `GET /api/ps`, `POST /api/show`, `POST /api/pull` (NDJSON
-progress), `POST /api/chat`, `POST /api/generate`, `GET /v1/models`,
+progress), `DELETE /api/delete`, `POST /api/chat`, `POST /api/generate`,
+`GET /v1/models`,
 `POST /v1/chat/completions` (JSON and SSE passthrough),
 `POST /v1/completions` (passthrough), and `GET /registry/model-path`.
 
@@ -152,8 +153,11 @@ no id) and `tool_name` tool results are converted to OpenAI's id/string form on
 the way in, and infr's streamed `tool_calls` deltas are reassembled into one
 Ollama chunk with parsed arguments on the way out. `/api/generate` takes no
 tools, matching Ollama.
-`ollama list`, `ps`, `show`, `pull` and `run` were all exercised against a live
-infr instance; `ollama rm` (`DELETE /api/delete`) is not wired yet.
+`ollama list`, `ps`, `show`, `pull`, `run` and `rm` were all exercised against a
+live infr instance. A delete stops the resident unit, removes the manifest and
+then every blob no other tag references, the way Ollama prunes its own store. A
+tag that only exists in a read-only store is refused instead of half-removed, and
+a `[[model]]` entry has to be taken out of the config.
 
 ## Install
 
