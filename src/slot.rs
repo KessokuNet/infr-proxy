@@ -57,6 +57,9 @@ enum Action {
 #[derive(Debug, Clone, Default)]
 struct ModelOverride {
     instance: Option<String>,
+    context_length: Option<u32>,
+    reasoning: Option<bool>,
+    vision: Option<bool>,
 }
 
 /// One resident model at a time; ids resolve through config, then the cache.
@@ -114,6 +117,9 @@ impl Slot {
                 canonical_key(&entry.id),
                 ModelOverride {
                     instance: entry.instance.clone(),
+                    context_length: entry.context_length,
+                    reasoning: entry.reasoning,
+                    vision: entry.vision,
                 },
             );
             let Some(source) = &entry.source else {
@@ -130,6 +136,9 @@ impl Slot {
                 instance,
                 source: resolved.path,
                 digest: resolved.digest,
+                context_length: entry.context_length,
+                reasoning: entry.reasoning,
+                vision: entry.vision,
             };
             aliases.insert(canonical_key(&model.id), model.id.clone());
             models.insert(model.id.clone(), model);
@@ -275,6 +284,9 @@ impl Slot {
             instance,
             source: resolved.path,
             digest: resolved.digest,
+            context_length: over.and_then(|over| over.context_length),
+            reasoning: over.and_then(|over| over.reasoning),
+            vision: over.and_then(|over| over.vision),
         })
     }
 
@@ -636,6 +648,9 @@ mod tests {
             id: id.into(),
             instance: Some(id.into()),
             source: Some(source.to_string_lossy().into_owned()),
+            context_length: None,
+            reasoning: None,
+            vision: None,
         }
     }
 
@@ -911,6 +926,9 @@ mod tests {
             id: "qwen2.5:1.5b".into(),
             instance: Some("tiny".into()),
             source: None,
+            context_length: Some(4096),
+            reasoning: Some(true),
+            vision: Some(false),
         });
         let slot = Arc::new(
             Slot::with_host(config, host, dir.path().to_path_buf())
@@ -921,6 +939,9 @@ mod tests {
         let model = slot.model("qwen2.5:1.5b").await.unwrap();
         assert_eq!(model.instance, "tiny");
         assert_eq!(model.socket, dir.path().join("infr/tiny.sock"));
+        assert_eq!(model.context_length, Some(4096));
+        assert_eq!(model.reasoning, Some(true));
+        assert_eq!(model.vision, Some(false));
     }
 
     #[tokio::test]

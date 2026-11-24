@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Json;
 use axum::Router;
@@ -20,6 +21,8 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
+use crate::config::Model;
+use crate::gguf;
 use crate::registry::Reference;
 use crate::slot::{Lease, Slot, SlotError};
 use crate::telemetry::{HttpMeter, MeteredBody, MeteredStream, RequestMeter, Usage};
@@ -27,7 +30,19 @@ use crate::telemetry::{HttpMeter, MeteredBody, MeteredStream, RequestMeter, Usag
 #[derive(Clone)]
 struct AppState {
     slot: Arc<Slot>,
-    clients: Arc<Mutex<HashMap<std::path::PathBuf, reqwest::Client>>>,
+    clients: Arc<Mutex<HashMap<PathBuf, reqwest::Client>>>,
+    metadata: Arc<MetadataCache>,
+}
+
+#[derive(Default)]
+struct MetadataCache {
+    entries: Mutex<HashMap<PathBuf, CachedMetadata>>,
+}
+
+struct CachedMetadata {
+    modified: Option<SystemTime>,
+    len: u64,
+    metadata: Arc<gguf::Metadata>,
 }
 
 impl AppState {
@@ -42,12 +57,73 @@ impl AppState {
         clients.insert(socket.to_path_buf(), client.clone());
         Ok(client)
     }
+
+    /// Parse the GGUF header once per file revision; a failed read is cached as empty.
+    async fn metadata(&self, path: &str) -> Arc<gguf::Metadata> {
+        let stat = tokio::fs::metadata(path).await.ok();
+        let modified = stat.as_ref().and_then(|stat| stat.modified().ok());
+        let len = stat.as_ref().map_or(0, std::fs::Metadata::len);
+        if let Some(cached) = self.metadata.entries.lock().await.get(Path::new(path))
+            && cached.modified == modified
+            && cached.len == len
+        {
+            return Arc::clone(&cached.metadata);
+        }
+
+        let parsed = tokio::task::spawn_blocking({
+            let path = path.to_owned();
+            move || gguf::read(Path::new(&path))
+        })
+        .await;
+        let metadata = match parsed {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(err)) => {
+                tracing::debug!(path, error = %err, "could not read GGUF metadata");
+                gguf::Metadata::default()
+            }
+            Err(err) => {
+                tracing::warn!(path, error = %err, "GGUF metadata task failed");
+                gguf::Metadata::default()
+            }
+        };
+
+        let metadata = Arc::new(metadata);
+        self.metadata.entries.lock().await.insert(
+            PathBuf::from(path),
+            CachedMetadata {
+                modified,
+                len,
+                metadata: Arc::clone(&metadata),
+            },
+        );
+        metadata
+    }
+
+    /// An explicit override beats the live window, which beats the trained ceiling.
+    async fn reported_context(
+        &self,
+        model: &Model,
+        metadata: &gguf::Metadata,
+        resident: bool,
+    ) -> Option<u64> {
+        if let Some(context_length) = model.context_length {
+            return Some(u64::from(context_length));
+        }
+        if resident {
+            let live = context_length(self, &model.id, &model.socket).await;
+            if live > 0 {
+                return Some(live);
+            }
+        }
+        metadata.context_length.map(u64::from)
+    }
 }
 
 pub fn router(slot: Arc<Slot>) -> Router {
     let state = AppState {
         slot,
         clients: Arc::new(Mutex::new(HashMap::new())),
+        metadata: Arc::new(MetadataCache::default()),
     };
     Router::new()
         .route("/", get(root).head(root))
@@ -172,29 +248,129 @@ struct TagEntry {
 #[derive(Serialize)]
 struct ModelDetails {
     format: &'static str,
-    family: &'static str,
+    family: String,
     families: Vec<String>,
-    parameter_size: &'static str,
-    quantization_level: &'static str,
+    parameter_size: String,
+    quantization_level: String,
 }
 
-fn details() -> ModelDetails {
+fn details(metadata: &gguf::Metadata) -> ModelDetails {
+    let family = metadata.architecture.clone().unwrap_or_default();
     ModelDetails {
         format: "gguf",
-        family: "",
-        families: Vec::new(),
-        parameter_size: "",
-        quantization_level: "",
+        families: if family.is_empty() {
+            Vec::new()
+        } else {
+            vec![family.clone()]
+        },
+        family,
+        parameter_size: metadata
+            .parameter_count
+            .map(parameter_size)
+            .unwrap_or_default(),
+        quantization_level: metadata
+            .file_type
+            .map(quantization)
+            .unwrap_or_default()
+            .to_owned(),
     }
+}
+
+/// The GGUF `general.parameter_count`, rendered the way Ollama renders details.
+fn parameter_size(count: u64) -> String {
+    if count >= 1_000_000_000 {
+        format!("{:.1}B", count as f64 / 1_000_000_000.0)
+    } else if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+/// `general.file_type` uses llama.cpp's `llama_ftype`; names match what the file was built as.
+fn quantization(file_type: u32) -> &'static str {
+    match file_type {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        36 => "TQ1_0",
+        37 => "TQ2_0",
+        38 => "MXFP4_MOE",
+        39 => "NVFP4",
+        40 => "Q1_0",
+        41 => "Q2_0",
+        42 => "F8_E4M3",
+        _ => "",
+    }
+}
+
+/// The `model_info` keys clients read: architecture and the context window under it.
+fn model_info(metadata: &gguf::Metadata, context_length: Option<u64>) -> serde_json::Value {
+    let mut info = serde_json::Map::new();
+    if let Some(architecture) = &metadata.architecture {
+        info.insert("general.architecture".into(), json!(architecture));
+        if let Some(context_length) = context_length {
+            info.insert(
+                format!("{architecture}.context_length"),
+                json!(context_length),
+            );
+        }
+    }
+    if let Some(parameter_count) = metadata.parameter_count {
+        info.insert("general.parameter_count".into(), json!(parameter_count));
+    }
+    if let Some(file_type) = metadata.file_type {
+        info.insert("general.file_type".into(), json!(file_type));
+    }
+    serde_json::Value::Object(info)
+}
+
+fn capabilities(model: &Model) -> Vec<&'static str> {
+    let mut capabilities = vec!["completion"];
+    if model.reasoning == Some(true) {
+        capabilities.push("thinking");
+    }
+    if model.vision == Some(true) {
+        capabilities.push("vision");
+    }
+    capabilities
 }
 
 async fn tags(State(state): State<AppState>) -> Json<TagsResponse> {
     let mut entries = Vec::new();
     for model in state.slot.models().await {
-        let meta = tokio::fs::metadata(&model.source).await.ok();
-        let modified = meta
+        let metadata = state.metadata(&model.source).await;
+        let stat = tokio::fs::metadata(&model.source).await.ok();
+        let modified = stat
             .as_ref()
-            .and_then(|meta| meta.modified().ok())
+            .and_then(|stat| stat.modified().ok())
             .map(|time| {
                 OffsetDateTime::from(time)
                     .format(&Rfc3339)
@@ -205,9 +381,9 @@ async fn tags(State(state): State<AppState>) -> Json<TagsResponse> {
             name: model.id.clone(),
             model: model.id.clone(),
             modified_at: modified,
-            size: meta.map_or(0, |meta| meta.len()),
+            size: stat.map_or(0, |stat| stat.len()),
             digest: model.digest.clone(),
-            details: details(),
+            details: details(&metadata),
         });
     }
     Json(TagsResponse { models: entries })
@@ -250,13 +426,16 @@ async fn show(
         .model(&id)
         .await
         .map_err(|err| ApiError::from_slot(err, &id))?;
+    let metadata = state.metadata(&model.source).await;
+    let resident = state.slot.resident().await.is_some_and(|id| id == model.id);
+    let context_length = state.reported_context(&model, &metadata, resident).await;
     Ok(Json(json!({
         "modelfile": format!("# infr-proxy model {id}\n"),
         "parameters": "",
         "template": "",
-        "details": details(),
-        "model_info": {},
-        "capabilities": ["completion"],
+        "details": details(&metadata),
+        "model_info": model_info(&metadata, context_length),
+        "capabilities": capabilities(&model),
         "modified_at": OffsetDateTime::from(
             tokio::fs::metadata(&model.source)
                 .await
@@ -336,6 +515,7 @@ async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
             .await
             .map(|meta| meta.len())
             .unwrap_or(0);
+        let metadata = state.metadata(&model.source).await;
         entries.push(PsEntry {
             name: model.id.clone(),
             model: model.id.clone(),
@@ -345,7 +525,7 @@ async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
                 .format(&Rfc3339)
                 .unwrap_or_default(),
             context_length: context_length(&state, &model.id, &model.socket).await,
-            details: details(),
+            details: details(&metadata),
         });
     }
     Json(PsResponse { models: entries })
@@ -362,6 +542,8 @@ struct ModelEntry {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u64>,
 }
 
 /// infr reports the per-slot window a request actually gets in `/status`.
@@ -391,17 +573,19 @@ async fn context_length(state: &AppState, id: &str, socket: &Path) -> u64 {
 }
 
 async fn models(State(state): State<AppState>) -> Json<ModelList> {
-    let data = state
-        .slot
-        .models()
-        .await
-        .into_iter()
-        .map(|model| ModelEntry {
+    let resident = state.slot.resident().await;
+    let mut data = Vec::new();
+    for model in state.slot.models().await {
+        let metadata = state.metadata(&model.source).await;
+        let is_resident = resident.as_deref() == Some(model.id.as_str());
+        let context_length = state.reported_context(&model, &metadata, is_resident).await;
+        data.push(ModelEntry {
             id: model.id,
             object: "model",
             owned_by: "infr-proxy",
-        })
-        .collect();
+            context_length,
+        });
+    }
     Json(ModelList {
         object: "list",
         data,
@@ -998,9 +1182,13 @@ mod tests {
 
     impl Proxy {
         async fn start(backend: Router) -> Self {
+            Self::start_with_source(backend, b"model bytes").await
+        }
+
+        async fn start_with_source(backend: Router, source_bytes: &[u8]) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let source = dir.path().join("model.gguf");
-            tokio::fs::write(&source, b"model bytes").await.unwrap();
+            tokio::fs::write(&source, source_bytes).await.unwrap();
 
             let runtime = dir.path().join("runtime");
             tokio::fs::create_dir_all(runtime.join("infr"))
@@ -1025,6 +1213,9 @@ mod tests {
                     id: "test:model".into(),
                     instance: Some("test-model".into()),
                     source: Some(source.to_string_lossy().into_owned()),
+                    context_length: None,
+                    reasoning: None,
+                    vision: None,
                 }],
                 exclude: Vec::new(),
             };
@@ -1092,5 +1283,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ps["models"][0]["context_length"], 32768);
+
+        let models: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/models", proxy.addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(models["data"][0]["context_length"], 32768);
+    }
+
+    #[tokio::test]
+    async fn show_reports_the_gguf_metadata() {
+        use crate::gguf::test_support::{Value, gguf};
+
+        let source = gguf(&[
+            ("general.architecture", Value::Str("qwen3")),
+            ("qwen3.context_length", Value::U32(262_144)),
+            ("general.file_type", Value::U32(15)),
+            ("general.parameter_count", Value::U64(7_615_000_000)),
+        ]);
+        let proxy = Proxy::start_with_source(Router::new(), &source).await;
+
+        let show: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://{}/api/show", proxy.addr))
+            .json(&json!({ "model": "test:model" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(show["model_info"]["general.architecture"], "qwen3");
+        assert_eq!(show["model_info"]["qwen3.context_length"], 262_144);
+        assert_eq!(show["details"]["family"], "qwen3");
+        assert_eq!(show["details"]["quantization_level"], "Q4_K_M");
+        assert_eq!(show["details"]["parameter_size"], "7.6B");
+        assert_eq!(show["capabilities"], json!(["completion"]));
     }
 }

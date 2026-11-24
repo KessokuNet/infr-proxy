@@ -25,6 +25,9 @@ max_model_size = "8GiB"
 # [[model]]
 # id = "qwen2.5:1.5b"
 # instance = "qwen2.5-1.5b" # derived from the id when absent
+# context_length = 32768   # runtime window when the trained context is not what fits
+# reasoning = true         # Pi clients budget the reply for reasoning tokens
+# vision = false           # only when the backend actually accepts images
 #
 # [[model]]
 # id = "local-model"

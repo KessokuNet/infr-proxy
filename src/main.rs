@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod gguf;
 mod host;
 mod registry;
 mod slot;

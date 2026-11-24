@@ -124,6 +124,27 @@ progress), `POST /api/chat`, `POST /api/generate`, `GET /v1/models`,
 `/api/ps` reports the loaded instance's `context_length` (infr's
 `ctx_per_slot`, so with `--parallel` it is the per-request window).
 
+`/api/show` and `/api/tags` read the GGUF header, so clients get the real
+architecture, trained context, parameter count and quantization instead of the
+empty `model_info` an Ollama shim usually leaves behind. The header is parsed
+once per file revision and cached; tensors are never touched. `/v1/models`
+carries the same `context_length`. For the resident model the reported window is
+the live `ctx_per_slot`, not the trained ceiling, because infr clamps context to
+VRAM at load; an idle model reports its trained context until it has run once.
+
+A `[[model]]` entry can correct what the header cannot answer:
+
+```toml
+[[model]]
+id = "qwen2.5:1.5b"
+context_length = 32768  # the window the card actually fits
+reasoning = true        # template has a thinking switch; Pi budgets for it
+vision = false          # only when the backend accepts images
+```
+
+`reasoning` and `vision` map to Ollama's `thinking` and `vision` capabilities;
+both default to unset, so no capability is claimed without evidence.
+
 The Ollama chat paths translate infr's OpenAI SSE into Ollama's NDJSON, so
 `ollama run` streams through the proxy exactly as it would against Ollama.
 `ollama list`, `ps`, `show`, `pull` and `run` were all exercised against a live

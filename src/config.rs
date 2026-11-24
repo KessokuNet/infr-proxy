@@ -51,6 +51,15 @@ pub struct ModelEntry {
     /// GGUF path or registry reference; absent means resolve the id from the cache.
     #[serde(default)]
     pub source: Option<String>,
+    /// Runtime window override; the GGUF's trained context is a ceiling, not what the card fits.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// Advertise a thinking model, so Pi budgets the reply for reasoning tokens.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    /// Advertise image input; only when the backend actually accepts images.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// A model that can be started: the cache or a config source resolved to a file.
@@ -61,6 +70,9 @@ pub struct Model {
     pub source: String,
     pub socket: PathBuf,
     pub digest: String,
+    pub context_length: Option<u32>,
+    pub reasoning: Option<bool>,
+    pub vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +193,9 @@ impl Config {
                 .is_some_and(|source| source.is_empty())
             {
                 bail!("model {:?} has an empty source", model.id);
+            }
+            if model.context_length == Some(0) {
+                bail!("model {:?} has a zero context_length", model.id);
             }
             if !ids.insert(model.id.as_str()) {
                 bail!("duplicate model id {:?}", model.id);
