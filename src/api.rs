@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -729,6 +729,8 @@ struct OllamaChatRequest {
     #[serde(default)]
     stream: bool,
     options: Option<serde_json::Value>,
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -753,6 +755,7 @@ async fn ollama_chat(
         &id,
         request.messages,
         request.options,
+        request.tools,
         request.stream,
         false,
     )
@@ -774,7 +777,16 @@ async fn ollama_generate(
         "role": "user",
         "content": request.prompt.unwrap_or_default(),
     }));
-    run_ollama(&state, &id, messages, request.options, request.stream, true).await
+    run_ollama(
+        &state,
+        &id,
+        messages,
+        request.options,
+        None,
+        request.stream,
+        true,
+    )
+    .await
 }
 
 async fn run_ollama(
@@ -782,6 +794,7 @@ async fn run_ollama(
     id: &str,
     messages: Vec<serde_json::Value>,
     options: Option<serde_json::Value>,
+    tools: Option<Vec<serde_json::Value>>,
     stream: bool,
     generate: bool,
 ) -> Result<Response, OllamaError> {
@@ -796,7 +809,14 @@ async fn run_ollama(
         "/api/chat"
     };
 
-    let mut body = json!({ "model": model.id, "messages": messages, "stream": stream });
+    let mut body = json!({
+        "model": model.id,
+        "messages": openai_messages(messages),
+        "stream": stream,
+    });
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        body["tools"] = json!(tools);
+    }
     if let Some(options) = options {
         for (from, to) in [
             ("temperature", "temperature"),
@@ -889,12 +909,25 @@ async fn run_ollama(
         meter.add_response_bytes(bytes.len() as u64);
         meter.observe_event(&reply);
         let usage = Usage::from_json(&reply);
-        let content = reply["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default();
+        let choice = &reply["choices"][0];
+        let content = choice["message"]["content"].as_str().unwrap_or_default();
+        let tool_calls = if generate {
+            None
+        } else {
+            ollama_tool_calls(&choice["message"])
+        };
+        let finish_reason = choice["finish_reason"].as_str();
         drop(lease);
         meter.finish();
-        return Ok(Json(ollama_final(&running.id, content, generate, usage)).into_response());
+        return Ok(Json(ollama_final(
+            &running.id,
+            content,
+            generate,
+            usage,
+            tool_calls,
+            finish_reason,
+        ))
+        .into_response());
     }
 
     let (tx, rx) = mpsc::channel::<serde_json::Value>(32);
@@ -923,6 +956,9 @@ async fn stream_ollama(
 ) {
     let _lease = lease;
     let mut usage = None;
+    let mut finish_reason: Option<String> = None;
+    let mut tool_calls = BTreeMap::new();
+    let mut tool_calls_sent = false;
     let mut buffer = Vec::new();
     let mut stream = upstream.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -943,7 +979,22 @@ async fn stream_ollama(
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
-                let _ = tx.send(ollama_final(&id, "", generate, usage)).await;
+                if !tool_calls_sent && !tool_calls.is_empty() {
+                    let calls = pending_tool_calls(&tool_calls);
+                    if tx.send(ollama_tool_chunk(&id, &calls)).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = tx
+                    .send(ollama_final(
+                        &id,
+                        "",
+                        generate,
+                        usage,
+                        None,
+                        finish_reason.as_deref(),
+                    ))
+                    .await;
                 return;
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
@@ -953,6 +1004,25 @@ async fn stream_ollama(
             if let Some(found) = Usage::from_json(&value) {
                 usage = Some(found);
             }
+            if let Some(deltas) = value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(serde_json::Value::as_array)
+            {
+                accumulate_tool_calls(&mut tool_calls, deltas);
+            }
+            if let Some(reason) = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                finish_reason.get_or_insert_with(|| reason.to_owned());
+                if !tool_calls_sent && !tool_calls.is_empty() {
+                    let calls = pending_tool_calls(&tool_calls);
+                    if tx.send(ollama_tool_chunk(&id, &calls)).await.is_err() {
+                        return;
+                    }
+                    tool_calls_sent = true;
+                }
+            }
             if let Some(content) = value["choices"][0]["delta"]["content"].as_str()
                 && !content.is_empty()
                 && tx.send(ollama_chunk(&id, content, generate)).await.is_err()
@@ -961,7 +1031,180 @@ async fn stream_ollama(
             }
         }
     }
-    let _ = tx.send(ollama_final(&id, "", generate, usage)).await;
+    if !tool_calls_sent && !tool_calls.is_empty() {
+        let calls = pending_tool_calls(&tool_calls);
+        if tx.send(ollama_tool_chunk(&id, &calls)).await.is_err() {
+            return;
+        }
+    }
+    let _ = tx
+        .send(ollama_final(
+            &id,
+            "",
+            generate,
+            usage,
+            None,
+            finish_reason.as_deref(),
+        ))
+        .await;
+}
+
+/// Ollama's tool turns carry arguments as objects and name the function on a tool
+/// result; OpenAI wants a JSON string, a call type, ids, and a `tool_call_id`.
+fn openai_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut pending: HashMap<String, VecDeque<String>> = HashMap::new();
+    let mut next_id = 0usize;
+    let mut translated = Vec::with_capacity(messages.len());
+
+    for mut message in messages {
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("assistant") => {
+                if let Some(calls) = message
+                    .get_mut("tool_calls")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for call in calls {
+                        next_id += 1;
+                        let id = call
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("call_{next_id}"));
+                        call["id"] = json!(id);
+                        call["type"] = json!("function");
+                        if let Some(arguments) = call.pointer_mut("/function/arguments")
+                            && !arguments.is_string()
+                        {
+                            *arguments = json!(arguments.to_string());
+                        }
+                        let name = call
+                            .pointer("/function/name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        pending.entry(name).or_default().push_back(id);
+                    }
+                }
+                translated.push(message);
+            }
+            Some("tool") => {
+                let name = message
+                    .get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if message
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                {
+                    let id = pending
+                        .get_mut(&name)
+                        .and_then(VecDeque::pop_front)
+                        .or_else(|| pending.values_mut().find_map(VecDeque::pop_front));
+                    if let Some(id) = id {
+                        message["tool_call_id"] = json!(id);
+                    }
+                }
+                if let Some(object) = message.as_object_mut() {
+                    object.remove("tool_name");
+                }
+                translated.push(message);
+            }
+            _ => translated.push(message),
+        }
+    }
+    translated
+}
+
+/// OpenAI's assistant message with `tool_calls`, translated to Ollama's shape.
+fn ollama_tool_calls(message: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    let calls = message.get("tool_calls")?.as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let name = call
+                    .pointer("/function/name")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let arguments = match call.pointer("/function/arguments") {
+                    Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(error = %err, "tool call arguments were not JSON");
+                            json!({})
+                        }),
+                    Some(arguments) => arguments.clone(),
+                    None => json!({}),
+                };
+                let mut translated = json!({
+                    "function": { "index": index, "name": name, "arguments": arguments },
+                });
+                if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                    translated["id"] = json!(id);
+                }
+                translated
+            })
+            .collect(),
+    )
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// OpenAI streams a tool call as an id/name header followed by argument fragments.
+fn accumulate_tool_calls(calls: &mut BTreeMap<u64, PendingToolCall>, deltas: &[serde_json::Value]) {
+    for (position, delta) in deltas.iter().enumerate() {
+        let index = delta
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(position as u64);
+        let call = calls.entry(index).or_default();
+        if let Some(id) = delta.get("id").and_then(serde_json::Value::as_str) {
+            call.id = Some(id.to_owned());
+        }
+        if let Some(name) = delta
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+        {
+            call.name.push_str(name);
+        }
+        if let Some(arguments) = delta
+            .pointer("/function/arguments")
+            .and_then(serde_json::Value::as_str)
+        {
+            call.arguments.push_str(arguments);
+        }
+    }
+}
+
+fn pending_tool_calls(calls: &BTreeMap<u64, PendingToolCall>) -> Vec<serde_json::Value> {
+    calls
+        .values()
+        .enumerate()
+        .map(|(index, call)| {
+            let arguments = serde_json::from_str(&call.arguments).unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "streamed tool arguments were not JSON");
+                json!({})
+            });
+            let mut translated = json!({
+                "function": { "index": index, "name": call.name, "arguments": arguments },
+            });
+            if let Some(id) = &call.id {
+                translated["id"] = json!(id);
+            }
+            translated
+        })
+        .collect()
 }
 
 fn timestamp() -> String {
@@ -983,31 +1226,50 @@ fn ollama_chunk(id: &str, content: &str, generate: bool) -> serde_json::Value {
     }
 }
 
+fn ollama_tool_chunk(id: &str, calls: &[serde_json::Value]) -> serde_json::Value {
+    json!({
+        "model": id,
+        "created_at": timestamp(),
+        "message": { "role": "assistant", "content": "", "tool_calls": calls },
+        "done": false,
+    })
+}
+
 fn ollama_final(
     id: &str,
     content: &str,
     generate: bool,
     usage: Option<Usage>,
+    tool_calls: Option<Vec<serde_json::Value>>,
+    finish_reason: Option<&str>,
 ) -> serde_json::Value {
     let prompt = usage.map_or(0, |usage| usage.prompt);
     let completion = usage.map_or(0, |usage| usage.completion);
+    let done_reason = match finish_reason {
+        Some("length") => "length",
+        _ => "stop",
+    };
     if generate {
         json!({
             "model": id,
             "created_at": timestamp(),
             "response": content,
             "done": true,
-            "done_reason": "stop",
+            "done_reason": done_reason,
             "eval_count": completion,
             "prompt_eval_count": prompt,
         })
     } else {
+        let mut message = json!({ "role": "assistant", "content": content });
+        if let Some(tool_calls) = tool_calls.filter(|calls| !calls.is_empty()) {
+            message["tool_calls"] = json!(tool_calls);
+        }
         json!({
             "model": id,
             "created_at": timestamp(),
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "done": true,
-            "done_reason": "stop",
+            "done_reason": done_reason,
             "eval_count": completion,
             "prompt_eval_count": prompt,
         })
@@ -1293,6 +1555,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(models["data"][0]["context_length"], 32768);
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_translates_tool_turns_and_calls() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&captured);
+        let proxy = Proxy::start(Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    *recorder.lock().unwrap() = Some(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_7",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": "{\"city\":\"Toronto\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": { "prompt_tokens": 12, "completion_tokens": 8 }
+                    }))
+                }
+            }),
+        ))
+        .await;
+
+        let reply: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://{}/api/chat", proxy.addr))
+            .json(&json!({
+                "model": "test:model",
+                "messages": [
+                    { "role": "user", "content": "Weather in Toronto?" },
+                    { "role": "assistant", "content": "", "tool_calls": [
+                        { "function": { "name": "get_weather", "arguments": { "city": "Toronto" } } }
+                    ] },
+                    { "role": "tool", "content": "{\"temp\":20}", "tool_name": "get_weather" },
+                    { "role": "user", "content": "Thanks" }
+                ],
+                "tools": [{ "type": "function", "function": {
+                    "name": "get_weather",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+                } }],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(reply["message"]["tool_calls"][0]["id"], "call_7");
+        assert_eq!(
+            reply["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            reply["message"]["tool_calls"][0]["function"]["arguments"]["city"],
+            "Toronto"
+        );
+        assert_eq!(reply["done"], true);
+        assert_eq!(reply["done_reason"], "stop");
+
+        let sent = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(sent["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(sent["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(sent["messages"][1]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            sent["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Toronto\"}"
+        );
+        assert_eq!(sent["messages"][2]["tool_call_id"], "call_1");
+        assert!(sent["messages"][2].get("tool_name").is_none());
+    }
+
+    #[test]
+    fn a_tool_result_without_a_matching_name_reuses_the_queued_call() {
+        let translated = super::openai_messages(vec![
+            json!({ "role": "assistant", "tool_calls": [
+                { "function": { "name": "get_weather", "arguments": { "city": "Toronto" } } }
+            ] }),
+            json!({ "role": "tool", "content": "20C" }),
+        ]);
+
+        assert_eq!(translated[1]["tool_call_id"], "call_1");
     }
 
     #[tokio::test]

@@ -147,6 +147,11 @@ both default to unset, so no capability is claimed without evidence.
 
 The Ollama chat paths translate infr's OpenAI SSE into Ollama's NDJSON, so
 `ollama run` streams through the proxy exactly as it would against Ollama.
+`/api/chat` also carries tool calling: Ollama's `tool_calls` (object arguments,
+no id) and `tool_name` tool results are converted to OpenAI's id/string form on
+the way in, and infr's streamed `tool_calls` deltas are reassembled into one
+Ollama chunk with parsed arguments on the way out. `/api/generate` takes no
+tools, matching Ollama.
 `ollama list`, `ps`, `show`, `pull` and `run` were all exercised against a live
 infr instance; `ollama rm` (`DELETE /api/delete`) is not wired yet.
 
